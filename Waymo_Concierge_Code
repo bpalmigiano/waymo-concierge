@@ -1,0 +1,267 @@
+import express from "express";
+import path from "path";
+import { createServer as createViteServer } from "vite";
+import { GoogleGenAI, Type } from "@google/genai";
+import { JOE_BRUIN, TIER_OPTIONS, RECENT_TRANSACTIONS, USAGE_90_DAYS, WHAT_IF_90D, POLICIES, SYSTEM_PROMPT } from "./src/constants";
+
+// --- Gemini Implementation ---
+const apiKey = process.env.GEMINI_API_KEY || "";
+const ai = new GoogleGenAI({
+  apiKey,
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build',
+    }
+  }
+});
+
+let currentSubscriber = { ...JOE_BRUIN };
+let tokens: Record<string, { type: string, data: any, expires: number }> = {};
+const generateToken = () => "ct_" + Math.random().toString(36).substring(2, 15);
+
+const tools = {
+  getSubscriberProfile: () => currentSubscriber,
+  getRecentTransactions: ({ limit = 5 }: { limit?: number }) => ({ transactions: RECENT_TRANSACTIONS.slice(0, limit) }),
+  getUsageHistory: ({ days = 90 }: { days?: number }) => {
+    const dailyBreakdown = Array.from({ length: 90 }, (_, i) => ({
+      date: new Date(2026, 1, 1).toISOString().split('T')[0],
+      miles: (Math.random() * 10).toFixed(1)
+    }));
+    return { summary: USAGE_90_DAYS, dailyBreakdown };
+  },
+  getTierOptions: () => ({ tiers: TIER_OPTIONS }),
+  computeWhatIf: ({ days = 90, targetTierId }: { days?: number, targetTierId?: string }) => {
+    if (targetTierId) {
+      const scenario = WHAT_IF_90D.scenarios.find(s => s.tier_id === targetTierId);
+      return { ...WHAT_IF_90D, scenarios: scenario ? [scenario] : [] };
+    }
+    return WHAT_IF_90D;
+  },
+  getPolicy: ({ topic }: { topic: string }) => ({ policy: POLICIES[topic] || "Policy not found." }),
+  previewTierChange: ({ targetTierId }: { targetTierId: string }) => {
+    const newTier = TIER_OPTIONS.find(t => t.tier_id === targetTierId);
+    if (!newTier) return { error: "Tier not found" };
+    const token = generateToken();
+    tokens[token] = { type: 'tier_change', data: { targetTierId, newTierDisplayName: newTier.display_name }, expires: Date.now() + 5 * 60 * 1000 };
+    return {
+      preview: {
+        current_tier: currentSubscriber.tier_display_name,
+        new_tier: newTier.display_name,
+        effective_date: "2026-06-01",
+        prorate_credit_cents: 1200,
+        miles_carryover: currentSubscriber.miles_used_this_cycle,
+        next_bill_amount_cents: newTier.monthly_price_cents
+      },
+      confirmation_token: token
+    };
+  },
+  commitTierChange: ({ token }: { token: string }) => {
+    const t = tokens[token];
+    if (t && t.type === 'tier_change' && t.expires > Date.now()) {
+      currentSubscriber.tier = t.data.targetTierId;
+      currentSubscriber.tier_display_name = t.data.newTierDisplayName;
+      delete tokens[token];
+      return { success: true, effective_date: "2026-06-01" };
+    }
+    return { error: "Invalid or expired token" };
+  },
+  previewPause: ({ months }: { months: number }) => {
+    const token = generateToken();
+    tokens[token] = { type: 'pause', data: { months }, expires: Date.now() + 5 * 60 * 1000 };
+    return {
+      preview: {
+        pause_starts: "2026-06-01",
+        pause_ends: new Date(2026, 5 + months, 1).toISOString().split('T')[0],
+        miles_carryover: 0
+      },
+      confirmation_token: token
+    };
+  },
+  commitPause: ({ token }: { token: string }) => {
+    const t = tokens[token];
+    if (t && t.type === 'pause' && t.expires > Date.now()) {
+      currentSubscriber.status = "paused";
+      delete tokens[token];
+      return { success: true };
+    }
+    return { error: "Invalid or expired token" };
+  },
+  previewCancel: () => {
+    const token = generateToken();
+    tokens[token] = { type: 'cancel', data: {}, expires: Date.now() + 5 * 60 * 1000 };
+    return {
+      preview: { cancel_effective_date: "2026-06-01", miles_remaining_until_then: currentSubscriber.miles_remaining },
+      confirmation_token: token
+    };
+  },
+  commitCancel: ({ token }: { token: string }) => {
+    const t = tokens[token];
+    if (t && t.type === 'cancel' && t.expires > Date.now()) {
+      currentSubscriber.status = "canceled_pending";
+      delete tokens[token];
+      return { success: true };
+    }
+    return { error: "Invalid or expired token" };
+  },
+  fileRefundRequest: ({ transactionId, reasonText }: { transactionId: string, reasonText: string }) => ({ ticket_id: "ref_" + Math.random().toString(36).substring(7), human_eta_hours: 24 }),
+  escalateToHuman: ({ category, summary }: { category: string, summary: string }) => ({ ticket_id: "esc_" + Math.random().toString(36).substring(7), human_eta_minutes: 15 })
+};
+
+const functionDeclarations = [
+  { name: "getSubscriberProfile", description: "Returns the subscriber's profile information." },
+  {
+    name: "getRecentTransactions",
+    description: "Returns a list of recent transactions.",
+    parameters: { type: Type.OBJECT, properties: { limit: { type: Type.NUMBER, description: "Max count" } } }
+  },
+  {
+    name: "getUsageHistory",
+    description: "Returns mileage usage summary.",
+    parameters: { type: Type.OBJECT, properties: { days: { type: Type.NUMBER, description: "Days of history" } } }
+  },
+  { name: "getTierOptions", description: "Returns available subscription tiers." },
+  {
+    name: "computeWhatIf",
+    description: "Computes cost comparison for tiers.",
+    parameters: { type: Type.OBJECT, properties: { days: { type: Type.NUMBER }, targetTierId: { type: Type.STRING } } }
+  },
+  {
+    name: "getPolicy",
+    description: "Retrieves policy text.",
+    parameters: { type: Type.OBJECT, properties: { topic: { type: Type.STRING } }, required: ["topic"] }
+  },
+  {
+    name: "previewTierChange",
+    description: "Preview a tier switch.",
+    parameters: { type: Type.OBJECT, properties: { targetTierId: { type: Type.STRING } }, required: ["targetTierId"] }
+  },
+  {
+    name: "commitTierChange",
+    description: "Finalize tier switch.",
+    parameters: { type: Type.OBJECT, properties: { token: { type: Type.STRING } }, required: ["token"] }
+  },
+  {
+    name: "previewPause",
+    description: "Preview a pause.",
+    parameters: { type: Type.OBJECT, properties: { months: { type: Type.NUMBER } }, required: ["months"] }
+  },
+  {
+    name: "commitPause",
+    description: "Finalize pause.",
+    parameters: { type: Type.OBJECT, properties: { token: { type: Type.STRING } }, required: ["token"] }
+  },
+  { name: "previewCancel", description: "Preview cancellation." },
+  {
+    name: "commitCancel",
+    description: "Finalize cancellation.",
+    parameters: { type: Type.OBJECT, properties: { token: { type: Type.STRING } }, required: ["token"] }
+  },
+  {
+    name: "fileRefundRequest",
+    description: "File refund request.",
+    parameters: { type: Type.OBJECT, properties: { transactionId: { type: Type.STRING }, reasonText: { type: Type.STRING } }, required: ["transactionId", "reasonText"] }
+  },
+  {
+    name: "escalateToHuman",
+    description: "Escalate to human rep.",
+    parameters: { type: Type.OBJECT, properties: { category: { type: Type.STRING }, summary: { type: Type.STRING } }, required: ["category", "summary"] }
+  }
+];
+
+// --- Express Server ---
+async function startServer() {
+  const app = express();
+  const PORT = 3000;
+  app.use(express.json());
+
+  app.get("/api/health", (req, res) => res.json({ status: "ok", env: process.env.NODE_ENV, hasKey: !!process.env.GEMINI_API_KEY }));
+  app.get("/api/subscriber", (req, res) => res.json(currentSubscriber));
+  app.post("/api/reset", (req, res) => {
+    currentSubscriber = { ...JOE_BRUIN };
+    tokens = {};
+    res.json({ success: true });
+  });
+
+  app.post("/api/chat", async (req, res) => {
+    try {
+      const { messages } = req.body;
+      const modelName = "gemini-2.0-flash";
+      const history = [];
+      
+      for (const m of messages.slice(0, -1)) {
+        if (m.role === 'user') {
+          history.push({ role: 'user', parts: [{ text: m.content || "" }] });
+        } else if (m.role === 'assistant') {
+          const parts: any[] = [];
+          if (m.content) parts.push({ text: m.content });
+          if (m.toolCalls?.length) {
+            m.toolCalls.forEach((tc: any) => parts.push({ functionCall: { name: tc.name, args: tc.arguments } }));
+          }
+          if (parts.length) history.push({ role: 'model', parts });
+          if (m.toolCalls?.length && m.toolCalls.every((tc: any) => tc.result !== undefined)) {
+            history.push({
+              role: 'user',
+              parts: m.toolCalls.map((tc: any) => ({ functionResponse: { name: tc.name, response: tc.result } }))
+            });
+          }
+        }
+      }
+
+      const lastMessage = messages[messages.length - 1];
+      if (!lastMessage || !lastMessage.content) {
+        return res.status(400).json({ error: "Missing user message content" });
+      }
+
+      if (!process.env.GEMINI_API_KEY) {
+        return res.status(500).json({ error: "GEMINI_API_KEY is not configured on the server." });
+      }
+
+      const activeChat = ai.chats.create({
+        model: modelName,
+        config: { systemInstruction: SYSTEM_PROMPT, tools: [{ functionDeclarations }] },
+        history
+      });
+
+      const lastUserMessage = lastMessage.content;
+      let result = await activeChat.sendMessage({ message: lastUserMessage });
+      let toolCallsThisTurn: any[] = [];
+
+      for (let i = 0; i < 5; i++) {
+        const fcs = result.functionCalls;
+        if (fcs?.length) {
+          const toolResults = await Promise.all(fcs.map(async (fc) => {
+            const name = fc.name as keyof typeof tools;
+            const args = fc.args;
+            const toolRes = await (tools[name] as any)(args);
+            toolCallsThisTurn.push({ name, arguments: args, result: toolRes });
+            return { functionResponse: { name, response: toolRes } };
+          }));
+          result = await activeChat.sendMessage({ message: toolResults as any });
+        } else {
+          break;
+        }
+      }
+
+      res.json({ text: result.text || "", toolCalls: toolCallsThisTurn });
+    } catch (error: any) {
+      console.error("Chat Error:", error);
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
+    app.use(vite.middlewares);
+  } else {
+    // In production, server.cjs is in the dist folder, so __dirname is the dist folder
+    const distPath = typeof __dirname !== 'undefined' ? __dirname : path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => console.log(`Server running on http://localhost:${PORT}`));
+}
+
+startServer();
